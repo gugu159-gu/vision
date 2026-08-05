@@ -1,0 +1,6 @@
+# 密钥文件绝不提交
+.env
+
+# Python
+__pycache__/
+*.pyc
