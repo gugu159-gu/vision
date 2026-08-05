@@ -9,7 +9,9 @@ vision.py — 本地识图工具
 
 用法:
     python vision.py <图片路径> [更多图片...] [-q "你想问的问题"]
-    python vision.py <图片目录>
+    python vision.py <图片目录>                      # 批量识别（默认并行 4）
+    python vision.py <图片目录> -c 6                 # 手动指定并行数
+    python vision.py <图片> -i                       # 识别后进入多轮对话（可追问）
 
 API Key 放在同目录的 .env 文件里（三个配置项）:
     VISION_BASE_URL=https://api.siliconflow.cn/v1/chat/completions
@@ -19,16 +21,24 @@ API Key 放在同目录的 .env 文件里（三个配置项）:
 
 import os
 import sys
+import time
 import base64
 import argparse
 import mimetypes
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
+
+# Windows 控制台默认 GBK 编码，遇到 emoji 等字符会直接崩溃，这里强制 UTF-8
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ---------------- 默认配置（硅基流动 Qwen3-VL） ----------------
 DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1/chat/completions"
 DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 DEFAULT_QUESTION = "请详细描述这张图片的内容，包括场景、主体、文字和颜色。"
+MAX_CONCURRENCY = 8  # 并行数上限，防止把 API 打爆
 
 
 def load_config():
@@ -59,15 +69,14 @@ def to_data_url(path: str) -> str:
     return f"data:{mime};base64,{b64}"
 
 
-def recognize(base_url, model, api_key, image_path, question):
-    """发送单张图片到视觉模型，返回描述文字。"""
-    content = [
-        {"type": "text", "text": question},
-        {"type": "image_url", "image_url": {"url": to_data_url(image_path)}},
-    ]
+def chat_once(base_url, model, api_key, messages, retries=2):
+    """发送一整套消息（支持多轮历史）到视觉模型，返回 (回答文本, usage)。
+
+    网络错误会带退避重试（最多 retries 次）。
+    """
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": content}],
+        "messages": messages,
         "temperature": 0.3,
         "max_tokens": 1024,
     }
@@ -76,19 +85,86 @@ def recognize(base_url, model, api_key, image_path, question):
         "Content-Type": "application/json",
     }
 
-    try:
-        resp = requests.post(base_url, json=payload, headers=headers, timeout=120)
-    except requests.RequestException as e:
-        return f"[网络错误] {e}"
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(base_url, json=payload, headers=headers, timeout=120)
+            break
+        except requests.RequestException as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(2 * (attempt + 1))  # 2s / 4s 退避
+    else:
+        return f"[网络错误] {last_err}", None
 
     if resp.status_code != 200:
-        return f"[请求失败 HTTP {resp.status_code}] {resp.text[:300]}"
+        return f"[请求失败 HTTP {resp.status_code}] {resp.text[:300]}", None
 
-    data = resp.json()
     try:
-        return data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError):
-        return f"[返回格式异常] {str(data)[:300]}"
+        resp.encoding = "utf-8"  # 强制 UTF-8，避免 chardet 误判成 GBK 导致中文乱码
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        usage = data.get("usage")
+        return content, usage
+    except Exception as e:
+        return f"[返回格式异常] {e}", None
+
+
+def recognize(base_url, model, api_key, image_path, question):
+    """发送单张图片到视觉模型，返回描述文字（单轮）。"""
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": question},
+            {"type": "image_url", "image_url": {"url": to_data_url(image_path)}},
+        ],
+    }]
+    answer, _ = chat_once(base_url, model, api_key, messages)
+    return answer
+
+
+def read_line(prompt=""):
+    """读一行输入，兼容两种 stdin 编码：UTF-8（管道/脚本喂入）和 GBK（Windows 控制台打字）。"""
+    if prompt:
+        print(prompt, end="", flush=True)
+    raw = sys.stdin.buffer.readline()
+    if not raw:  # EOF
+        return None
+    raw = raw.rstrip(b"\r\n")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:  # GBK 控制台输入会解码失败，退回系统编码
+        return raw.decode(sys.stdin.encoding or "gbk", errors="replace")
+
+
+def interactive_chat(base_url, model, api_key, image_path):
+    """对单张图片进行多轮对话：图片只在第一轮发送，之后带上历史继续追问。"""
+    print(f"进入对话模式：{image_path}")
+    print("直接回车 = 默认描述；输入 q / exit 退出；Ctrl+C 也可退出。")
+    history = []  # 已完成轮次的 user/assistant 消息
+    while True:
+        try:
+            q = read_line("💬 问题: ")
+        except (EOFError, KeyboardInterrupt):
+            break
+        if q is None:  # 输入流结束
+            break
+        q = q.strip()
+        if q.lower() in ("q", "exit", "quit"):
+            break
+        q = q or DEFAULT_QUESTION
+
+        content = [{"type": "text", "text": q}]
+        if not history:  # 第一轮才带上图片，之后靠历史上下文
+            content.append({"type": "image_url", "image_url": {"url": to_data_url(image_path)}})
+
+        messages = history + [{"role": "user", "content": content}]
+        print("-" * 44)
+        answer, _ = chat_once(base_url, model, api_key, messages)
+        print(answer)
+
+        history.append({"role": "user", "content": content})
+        history.append({"role": "assistant", "content": answer})
 
 
 def collect_images(paths):
@@ -111,6 +187,10 @@ def main():
     parser = argparse.ArgumentParser(description="本地识图工具（云端视觉模型）")
     parser.add_argument("paths", nargs="+", help="图片路径，可多个，也可以是目录")
     parser.add_argument("-q", "--question", default=DEFAULT_QUESTION, help="要问图片的问题")
+    parser.add_argument("-c", "--concurrency", type=int, default=4,
+                        help=f"并行识别数（默认 4，上限 {MAX_CONCURRENCY}）")
+    parser.add_argument("-i", "--interactive", action="store_true",
+                        help="识别后进入多轮对话模式（只对第一张图生效）")
     args = parser.parse_args()
 
     base_url, model, api_key = load_config()
@@ -124,11 +204,30 @@ def main():
         sys.exit(1)
 
     print(f"模型: {model}")
-    print(f"识别 {len(images)} 张图片…")
-    for i, img in enumerate(images, 1):
-        print(f"\n[{i}/{len(images)}] {img}")
-        print("-" * 44)
-        print(recognize(base_url, model, api_key, img, args.question))
+
+    if args.interactive:
+        if len(images) > 1:
+            print("注意: 对话模式只对第一张图片生效，其余忽略。")
+        interactive_chat(base_url, model, api_key, images[0])
+        return
+
+    concurrency = max(1, min(args.concurrency, MAX_CONCURRENCY))
+    print(f"识别 {len(images)} 张图片（并行 {concurrency}）…")
+
+    def safe_recognize(path):
+        """包一层，单张失败不影响整批。"""
+        try:
+            return recognize(base_url, model, api_key, path, args.question)
+        except Exception as e:
+            return f"[处理异常] {e}"
+
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        for i, (img, result) in enumerate(
+            zip(images, ex.map(safe_recognize, images)), 1
+        ):
+            print(f"\n[{i}/{len(images)}] {img}")
+            print("-" * 44)
+            print(result)
 
 
 if __name__ == "__main__":

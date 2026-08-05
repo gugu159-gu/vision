@@ -4,3 +4,6 @@
 # Python
 __pycache__/
 *.pyc
+
+# 本地测试图（不上传）
+demo_*.png
