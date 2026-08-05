@@ -12,6 +12,8 @@ vision.py — 本地识图工具
     python vision.py <图片目录>                      # 批量识别（默认并行 4）
     python vision.py <图片目录> -c 6                 # 手动指定并行数
     python vision.py <图片> -i                       # 识别后进入多轮对话（可追问）
+    python vision.py <图片> --json                   # 返回结构化 JSON（程序可直接解析）
+    python vision.py <图片> -o 结果.json             # 把结果保存到文件
 
 API Key 放在同目录的 .env 文件里（三个配置项）:
     VISION_BASE_URL=https://api.siliconflow.cn/v1/chat/completions
@@ -21,6 +23,7 @@ API Key 放在同目录的 .env 文件里（三个配置项）:
 
 import os
 import sys
+import json
 import time
 import base64
 import argparse
@@ -38,6 +41,12 @@ if hasattr(sys.stdout, "reconfigure"):
 DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1/chat/completions"
 DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 DEFAULT_QUESTION = "请详细描述这张图片的内容，包括场景、主体、文字和颜色。"
+DEFAULT_JSON_QUESTION = (
+    "请用 JSON 格式描述这张图片。只输出一个 JSON 对象，不要输出任何其他内容，字段如下：\n"
+    'scene(场景描述, string), subjects(主要主体, string数组), '
+    'text(图片中出现的所有文字, string数组), colors(主要颜色, string数组), '
+    'summary(一句话总结, string)'
+)
 MAX_CONCURRENCY = 8  # 并行数上限，防止把 API 打爆
 
 
@@ -69,10 +78,11 @@ def to_data_url(path: str) -> str:
     return f"data:{mime};base64,{b64}"
 
 
-def chat_once(base_url, model, api_key, messages, retries=2):
+def chat_once(base_url, model, api_key, messages, retries=2, json_mode=False):
     """发送一整套消息（支持多轮历史）到视觉模型，返回 (回答文本, usage)。
 
-    网络错误会带退避重试（最多 retries 次）。
+    网络错误会带退避重试（最多 retries 次）。json_mode=True 时请求带
+    response_format 强制模型输出 JSON。
     """
     payload = {
         "model": model,
@@ -80,6 +90,8 @@ def chat_once(base_url, model, api_key, messages, retries=2):
         "temperature": 0.3,
         "max_tokens": 1024,
     }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -110,8 +122,27 @@ def chat_once(base_url, model, api_key, messages, retries=2):
         return f"[返回格式异常] {e}", None
 
 
-def recognize(base_url, model, api_key, image_path, question):
-    """发送单张图片到视觉模型，返回描述文字（单轮）。"""
+def try_parse_json(text):
+    """尝试把模型回答解析成 JSON；容忍 ```json 代码块和前后杂散文本。"""
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`").strip()
+        if text.startswith("json"):
+            text = text[4:].strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def recognize(base_url, model, api_key, image_path, question, json_mode=False):
+    """发送单张图片到视觉模型，返回描述文字（单轮）。
+
+    json_mode=True 时要求返回 JSON；若 response_format 不被支持或模型没听话，
+    自动降级重试一次，仍失败则返回 {"error": ..., "raw": 原始回答}。
+    """
     messages = [{
         "role": "user",
         "content": [
@@ -119,6 +150,17 @@ def recognize(base_url, model, api_key, image_path, question):
             {"type": "image_url", "image_url": {"url": to_data_url(image_path)}},
         ],
     }]
+    if json_mode:
+        answer, _ = chat_once(base_url, model, api_key, messages, json_mode=True)
+        parsed = try_parse_json(answer)
+        if parsed is not None:
+            return parsed
+        # 降级：不带 response_format 再试一次，仅靠 prompt 约束
+        answer, _ = chat_once(base_url, model, api_key, messages, json_mode=False)
+        parsed = try_parse_json(answer)
+        if parsed is not None:
+            return parsed
+        return {"error": "模型未返回合法 JSON", "raw": answer}
     answer, _ = chat_once(base_url, model, api_key, messages)
     return answer
 
@@ -183,6 +225,26 @@ def collect_images(paths):
     return images
 
 
+def save_results(output, results, json_mode):
+    """把 [(图片路径, 结果), ...] 保存到文件。
+
+    .json 结尾 → JSON 数组；其他（.md/.txt）→ 人类可读文本。
+    """
+    if output.endswith(".json"):
+        data = [{"image": img, "result": res} for img, res in results]
+        with open(output, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    else:
+        with open(output, "w", encoding="utf-8") as f:
+            for img, res in results:
+                f.write(f"## {img}\n\n")
+                if json_mode:
+                    f.write(json.dumps(res, ensure_ascii=False, indent=2))
+                else:
+                    f.write(str(res))
+                f.write("\n\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="本地识图工具（云端视觉模型）")
     parser.add_argument("paths", nargs="+", help="图片路径，可多个，也可以是目录")
@@ -191,6 +253,10 @@ def main():
                         help=f"并行识别数（默认 4，上限 {MAX_CONCURRENCY}）")
     parser.add_argument("-i", "--interactive", action="store_true",
                         help="识别后进入多轮对话模式（只对第一张图生效）")
+    parser.add_argument("--json", action="store_true",
+                        help="要求模型返回结构化 JSON（程序可直接解析）")
+    parser.add_argument("-o", "--output",
+                        help="把结果保存到文件（.json 存 JSON 数组，.md/.txt 存文本）")
     args = parser.parse_args()
 
     base_url, model, api_key = load_config()
@@ -206,10 +272,19 @@ def main():
     print(f"模型: {model}")
 
     if args.interactive:
+        if args.json:
+            print("注意: 对话模式不支持 --json，已忽略。")
         if len(images) > 1:
             print("注意: 对话模式只对第一张图片生效，其余忽略。")
         interactive_chat(base_url, model, api_key, images[0])
         return
+
+    # --json 时替换/追加 JSON 输出约束
+    if args.json:
+        question = DEFAULT_JSON_QUESTION if args.question == DEFAULT_QUESTION \
+            else f"{args.question}\n请只用 JSON 对象格式回答，不要输出任何其他文字。"
+    else:
+        question = args.question
 
     concurrency = max(1, min(args.concurrency, MAX_CONCURRENCY))
     print(f"识别 {len(images)} 张图片（并行 {concurrency}）…")
@@ -217,17 +292,26 @@ def main():
     def safe_recognize(path):
         """包一层，单张失败不影响整批。"""
         try:
-            return recognize(base_url, model, api_key, path, args.question)
+            return recognize(base_url, model, api_key, path, question, json_mode=args.json)
         except Exception as e:
-            return f"[处理异常] {e}"
+            return {"error": f"[处理异常] {e}"} if args.json else f"[处理异常] {e}"
 
+    results = []
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
         for i, (img, result) in enumerate(
             zip(images, ex.map(safe_recognize, images)), 1
         ):
             print(f"\n[{i}/{len(images)}] {img}")
             print("-" * 44)
-            print(result)
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print(result)
+            results.append((img, result))
+
+    if args.output:
+        save_results(args.output, results, args.json)
+        print(f"\n已保存结果到: {args.output}")
 
 
 if __name__ == "__main__":

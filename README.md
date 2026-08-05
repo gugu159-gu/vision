@@ -8,6 +8,8 @@
 - 自定义提问
 - **批量并行识别**（`-c` 控制并发数，默认 4）
 - **多轮对话**（`-i`，识别后对同一张图连续追问）
+- **结构化 JSON 输出**（`--json`，结果可被程序直接解析）
+- **保存到文件**（`-o`，.json 存 JSON / .md、.txt 存文本）
 
 ## 用法
 
@@ -29,6 +31,13 @@ python vision.py 图.png -i
 
 # 批量识别 + 控制并行数（默认并行 4，上限 8）
 python vision.py ./截图 -c 6
+
+# 结构化 JSON 输出（可被 json.loads 直接解析）
+python vision.py 图.png --json
+
+# 把结果保存到文件（.json → JSON 数组；.md / .txt → 文本）
+python vision.py 图.png -o 结果.json
+python vision.py ./截图 --json -o 批量结果.json
 ```
 
 ## 配置
